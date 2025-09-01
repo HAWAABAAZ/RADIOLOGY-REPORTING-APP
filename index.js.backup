@@ -1,0 +1,1229 @@
+import 'dotenv/config';
+import express from "express";
+import http from "http";
+import { WebSocketServer } from "ws";
+import cors from "cors";
+import OpenAI from "openai";
+import multer from 'multer';
+import pkg from '@deepgram/sdk';
+
+import { authenticateSupabase } from './middleware/supabase-auth.js';
+import authRoutes from './routes/supabase-auth.js';
+import templateRoutes from './routes/templates.js';
+const { Deepgram } = pkg;
+
+const app = express();
+
+// Log all incoming HTTP requests
+app.use((req, res, next) => {
+  const start = Date.now();
+  const { method, originalUrl } = req;
+  const origin = req.headers.origin || '-';
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  console.log(`[REQ] ${method} ${originalUrl} origin=${origin} ip=${ip}`);
+  res.on('finish', () => {
+    const durationMs = Date.now() - start;
+    console.log(`[RES] ${method} ${originalUrl} status=${res.statusCode} durationMs=${durationMs}`);
+  });
+  next();
+});
+
+// Configure CORS to allow both local development and production frontend
+const corsOptions = {
+  origin: [
+    'http://localhost:3000', 
+    'http://localhost:5173', 
+    'http://127.0.0.1:3000', 
+    'http://127.0.0.1:5173',
+    // Production domains
+    'https://www.autoradai.com',
+    'https://autoradai.com',
+    process.env.FRONTEND_URL,
+    // Allow any Vercel deployment domain for this app
+    /^https:\/\/.*\.vercel\.app$/
+  ].filter(Boolean), // Remove undefined values
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
+// Serve static files (CSS, JS, images)
+app.use(express.static('public'));
+
+// Apply JSON parsing only to non-multipart routes
+app.use((req, res, next) => {
+  // Skip JSON parsing for file upload endpoints or if content-type suggests multipart
+  const isTranscribeEndpoint = req.path === '/api/transcribe';
+  const isMultipart = req.headers['content-type']?.includes('multipart/form-data');
+  
+  if (isTranscribeEndpoint || isMultipart) {
+    // Skip JSON parsing for transcribe endpoint and multipart uploads
+    next();
+  } else {
+    express.json({ limit: '1mb' })(req, res, next);
+  }
+});
+
+app.get("/", (_, res) => res.send("HTTP server is running ✅"));
+
+app.get("/health", (_, res) => res.json({ 
+  ok: true, 
+  time: new Date().toISOString(),
+  websocket: 'available',
+  deepgram_api: process.env.DEEPGRAM_API_KEY ? 'configured' : 'missing'
+}));
+app.get("/api/health", (_, res) => res.json({ 
+  ok: true, 
+  time: new Date().toISOString(),
+  websocket: 'available',
+  deepgram_api: process.env.DEEPGRAM_API_KEY ? 'configured' : 'missing'
+}));
+
+
+
+// Mount authentication routes
+app.use('/api/auth', authRoutes);
+
+// Mount template routes
+app.use('/api/templates', templateRoutes);
+
+// Debug endpoint to test authentication
+app.get('/api/auth/test', authenticateSupabase, (req, res) => {
+  res.json({
+    success: true,
+    message: 'Authentication successful',
+    user: {
+      id: req.user.id,
+      email: req.user.email
+    }
+  });
+});
+
+const server = http.createServer(app);
+
+// Configure WebSocket server for Render compatibility
+const wss = new WebSocketServer({ 
+  server, 
+  path: "/ws",
+  // Add Render-specific configurations
+  perMessageDeflate: false,
+  maxPayload: 16 * 1024 * 1024, // 16MB max payload
+});
+
+// Add explicit upgrade handler for WebSocket connections
+server.on('upgrade', (request, socket, head) => {
+  console.log('HTTP Upgrade request:', {
+    url: request.url,
+    headers: request.headers,
+    method: request.method
+  });
+  
+  // Check if this is a WebSocket upgrade for our path
+  if (request.url.startsWith('/ws')) {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      console.log('WebSocket upgrade successful for', request.url);
+      wss.emit('connection', ws, request);
+    });
+  } else {
+    console.log('Destroying non-WebSocket upgrade request for', request.url);
+    socket.destroy();
+  }
+});
+
+function heartbeat() { this.isAlive = true; }
+
+// Add WebSocket server error handling
+wss.on("error", (error) => {
+  console.error("WebSocket Server Error:", error);
+});
+
+wss.on("headers", (headers, req) => {
+  console.log("WebSocket upgrade headers:", headers);
+});
+
+console.log("WebSocket server initialized on path: /ws");
+
+// WebSocket test endpoint (now that wss is defined)
+app.get('/ws-test', (req, res) => {
+  res.json({
+    message: 'WebSocket server is running',
+    path: '/ws',
+    clients: wss.clients.size,
+    ready: true
+  });
+});
+
+wss.on("connection", (ws, req) => {
+  console.log("WS client connected from", req.socket.remoteAddress, "url", req.url);
+  console.log("WS headers:", req.headers);
+  ws.isAlive = true;
+  ws.on("pong", heartbeat);
+
+  // Detect mode from query: /ws?mode=stream
+  let mode = 'echo';
+  let enc = 'opus';
+  try {
+    const url = new URL(req.url, 'http://localhost');
+    mode = url.searchParams.get('mode') || 'echo';
+    enc = url.searchParams.get('enc') || 'opus';
+    console.log("WS parsed params - mode:", mode, "enc:", enc);
+  } catch (parseError) {
+    console.error("WS URL parse error:", parseError);
+  }
+
+  if (mode === 'stream') {
+    if (!process.env.DEEPGRAM_API_KEY) {
+      ws.send(JSON.stringify({ type: 'error', message: 'Deepgram API key not configured' }));
+      ws.close();
+      return;
+    }
+
+    // Direct WebSocket connection to Deepgram API as per documentation
+    const usePcm = enc === 'pcm16';
+    const dgParams = new URLSearchParams({
+      model: 'nova-2',
+      language: 'en-US',
+      punctuate: 'true',
+      interim_results: 'true',
+      smart_format: 'true',
+      encoding: usePcm ? 'linear16' : 'opus',
+      sample_rate: usePcm ? '44100' : '48000',
+      channels: '1',
+      endpointing: '300', // Slightly longer for better stability
+      utterance_end_ms: '1000',
+      vad_events: 'true', // Enable voice activity detection events
+      filler_words: 'true', // Include filler words like "uh", "um"
+      numerals: 'true' // Convert numbers to numerical format
+    });
+
+    const dgUrl = `wss://api.deepgram.com/v1/listen?${dgParams.toString()}`;
+    console.log('[DG] Connecting to:', dgUrl);
+
+    const WebSocket = require('ws');
+    const apiKey = process.env.DEEPGRAM_API_KEY;
+    console.log('[DG] Creating WebSocket with API key present:', !!apiKey);
+    console.log('[DG] API key length:', apiKey ? apiKey.length : 0);
+    
+    const dgWs = new WebSocket(dgUrl, {
+      headers: {
+        'Authorization': `token ${apiKey}` // Try 'Token' instead of 'token'
+      }
+    });
+
+    let dgOpen = false;
+
+    // Set a timeout for Deepgram connection
+    const dgTimeout = setTimeout(() => {
+      console.error('[DG] Connection timeout after 10 seconds');
+      if (!dgOpen) {
+        dgWs.close();
+        ws.close(1011, 'Deepgram connection timeout');
+      }
+    }, 10000);
+
+    dgWs.on('open', () => {
+      clearTimeout(dgTimeout);
+      dgOpen = true;
+      console.log('[DG] Direct WebSocket connection open');
+      console.log('[DG] Deepgram connection established successfully');
+      try {
+        ws.send(JSON.stringify({ type: 'ready' }));
+        console.log('[WS] Sent ready message to client');
+      } catch (sendError) {
+        console.error('[WS] Failed to send ready message:', sendError);
+      }
+    });
+
+    dgWs.on('error', (err) => {
+      clearTimeout(dgTimeout);
+      console.error('[DG] WebSocket error:', err?.message || err);
+      console.error('[DG] Full error object:', err);
+      try { 
+        ws.send(JSON.stringify({ type: 'error', message: `Deepgram error: ${err?.message || 'Unknown error'}` })); 
+      } catch (sendErr) {
+        console.error('[WS] Failed to send error message:', sendErr);
+      }
+      ws.close(1011, 'Deepgram connection failed');
+    });
+
+    dgWs.on('close', (code, reason) => {
+      console.log('[DG] WebSocket closed:', code, reason?.toString());
+      try { ws.send(JSON.stringify({ type: 'done' })); } catch (_) {}
+    });
+
+    dgWs.on('message', (message) => {
+      try {
+        const data = JSON.parse(message.toString());
+        console.log('[DG] Raw message type:', data.type);
+        
+        if (data.type === 'Results') {
+          const alt = data?.channel?.alternatives?.[0];
+          const transcript = alt?.transcript || '';
+          // Check both is_final and speech_final as per documentation
+          const isFinal = Boolean(data?.is_final || data?.speech_final);
+          
+          // Only send non-empty transcripts
+          if (transcript.trim()) {
+            console.log(`[DG] Transcript (${isFinal ? 'final' : 'interim'}):`, transcript);
+            try {
+              ws.send(JSON.stringify({ 
+                type: 'transcript', 
+                text: transcript, 
+                is_final: isFinal 
+              }));
+            } catch (sendErr) {
+              console.error('[DG->WS] Send error:', sendErr);
+            }
+          }
+        } else if (data.type === 'Metadata') {
+          console.log('[DG] Metadata received:', data);
+        } else if (data.type === 'UtteranceEnd') {
+          console.log('[DG] Utterance end');
+        } else if (data.type === 'SpeechStarted') {
+          console.log('[DG] Speech started');
+          // Optionally notify frontend that speech was detected
+          try {
+            ws.send(JSON.stringify({ type: 'speech_started' }));
+          } catch (_) {}
+        } else if (data.type === 'FinalizeResponse') {
+          console.log('[DG] Finalize response:', data);
+        } else if (data.type === 'CloseStreamResponse') {
+          console.log('[DG] Close stream response:', data);
+        } else {
+          console.log('[DG] Unknown message type:', data.type, data);
+        }
+      } catch (parseError) {
+        console.error('[DG] Parse error:', parseError);
+      }
+    });
+
+    ws.on('message', (chunk, isBinary) => {
+      if (!dgOpen) {
+        console.log('[WS] Dropping message, DG not ready yet, state:', dgWs.readyState);
+        return;
+      }
+      
+      try {
+        if (isBinary || Buffer.isBuffer(chunk)) {
+          // Audio data - forward directly to Deepgram WebSocket
+          console.log('[WS->DG] Forwarding audio chunk, size:', chunk.length);
+          if (dgWs.readyState === 1) { // WebSocket.OPEN
+            dgWs.send(chunk);
+          } else {
+            console.error('[WS->DG] Deepgram WebSocket not open, state:', dgWs.readyState);
+          }
+        } else {
+          // Text control messages
+          const text = chunk.toString();
+          console.log('[WS] Control message:', text);
+          if (text === 'FINISH') {
+            console.log('[WS] Finishing Deepgram connection');
+            dgWs.close();
+          }
+        }
+      } catch (e) {
+        console.error('[WS->DG] Send error:', e);
+        console.error('[WS->DG] Deepgram state during error:', dgWs.readyState);
+      }
+    });
+
+    ws.on('close', () => {
+      try { dgWs.close(); } catch (_) {}
+      console.log('WS (stream) closed');
+    });
+    ws.on('error', (e) => console.error('WS (stream) error:', e));
+    return;
+  }
+
+  // Default echo mode
+  ws.send(JSON.stringify({ type: 'welcome', msg: 'Hello from WS backend' }));
+  ws.on('message', (buf) => {
+    const text = buf.toString();
+    ws.send(JSON.stringify({ type: 'echo', msg: text }));
+  });
+  ws.on('close', () => console.log('WS closed'));
+  ws.on('error', (e) => console.error('WS error:', e));
+});
+
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) { ws.terminate(); continue; }
+    ws.isAlive = false; ws.ping();
+  }
+}, 30000);
+
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, '0.0.0.0', () => console.log("HTTP+WS listening on", PORT, "and accessible via web"));
+
+// OpenAI client
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Note: Old TypeScript system removed - using simplified approach
+
+// Report generation endpoint (requires authentication)
+app.post('/api/generate-report', authenticateSupabase, async (req, res) => {
+  try {
+    const {
+      prompt,
+      scan_name,
+      template_id = "",
+      findings_raw,
+      findings,
+      clinical_history = null,
+      simulate_clinical_questions = false,
+      includeAdvice = true,
+      includeQuestions = false,
+      include_questions = false
+    } = req.body || {};
+
+    // Use findings_raw if provided, otherwise fall back to findings
+    const actualFindings = findings_raw || findings;
+    
+
+    
+    // If we have findings but no scan_name, try to extract it from findings
+    let actualScanName = scan_name;
+    if (!actualScanName && actualFindings) {
+      // Try to extract scan name from the beginning of findings
+      const firstLine = actualFindings.split('\n')[0];
+      if (firstLine && firstLine.length < 100) {
+        actualScanName = firstLine.trim();
+      } else {
+        actualScanName = "Radiology Report"; // Default fallback
+      }
+    }
+
+    // Generate structured report using OpenAI directly
+    if (actualFindings) {
+        try {
+            // Create a comprehensive prompt for structured report generation
+            const reportPrompt = `
+You are an expert radiologist. Generate a comprehensive radiology report based on the following clinical history and findings.
+
+CLINICAL HISTORY:
+${clinical_history || 'NA'}
+
+FINDINGS:
+${actualFindings}
+
+SCAN TYPE: ${actualScanName}
+
+STRICT CONSISTENCY RULES (CRITICAL):
+- If any abnormality is described for an organ/structure, DO NOT include any 'normal'/'unremarkable' statements for that same organ.
+- Prefer a single consolidated description per organ. Remove contradictory "normal" sentences for organs with abnormalities.
+- Avoid phrases that conflict (e.g., 'liver is normal' and 'multiple liver lesions').
+
+Please generate a structured report with ALL of these sections:
+1. TECHNIQUE: Brief description of imaging protocol
+2. FINDINGS: Detailed description of imaging findings (include abnormal findings first)
+3. FINDINGS: Detailed description of imaging findings (include abnormal findings first)
+4. IMPRESSION: Clinical impression and diagnosis
+5. CLINICAL ADVICE: Recommendations for follow-up or treatment
+6. CLINICIAN QUESTIONS: 5 questions a referring physician might ask
+7. DIFFERENTIAL DIAGNOSIS: 3 possible diagnoses with explanation
+
+Format the response as JSON with the following structure:
+{
+  "technique": "Brief technique description",
+  "findings": "Detailed findings",
+
+  "impression": "Clinical impression",
+  "clinical_advice": "Clinical recommendations",
+  "clinician_questions": ["Question 1", "Question 2", "Question 3", "Question 4", "Question 5"],
+  "differential_diagnosis": [
+    {"diagnosis": "Diagnosis 1", "reasoning": "Why this is possible"},
+    {"diagnosis": "Diagnosis 2", "reasoning": "Why this is possible"},
+    {"diagnosis": "Diagnosis 3", "reasoning": "Why this is possible"}
+  ]
+}
+
+IMPORTANT: Never skip any section.
+`;
+
+            const response = await openai.chat.completions.create({
+                model: 'gpt-4o',
+                messages: [
+                    { role: 'system', content: 'You are an expert radiologist generating structured reports. Always respond with valid JSON.' },
+                    { role: 'user', content: reportPrompt }
+                ],
+                temperature: 0.3,
+                max_tokens: 2000,
+                response_format: { type: "json_object" }
+            });
+
+            const reportData = JSON.parse(response.choices[0].message.content);
+            
+            // Helper to remove conflicting normal statements when abnormalities are present
+            function cleanConflictingNormals(findingsText) {
+              try {
+                if (!findingsText) return findingsText;
+                const text = findingsText.replace(/\s+\n/g, '\n').replace(/\n\s+/g, '\n');
+
+                // Split into sentences conservatively
+                const sentences = text
+                  .replace(/\n+/g, ' ') // merge lines
+                  .split(/(?<=[.?!])\s+/);
+
+                const organs = [
+                  'liver', 'hepatic', 'gallbladder', 'biliary', 'pancreas', 'spleen', 'kidney', 'kidneys', 'adrenal', 'stomach',
+                  'small bowel', 'colon', 'appendix', 'mesentery', 'peritoneum', 'retroperitoneum', 'bladder', 'uterus', 'ovary', 'ovaries',
+                  'prostate', 'seminal vesicles', 'lungs', 'lung', 'pleura', 'mediastinum', 'heart', 'brain', 'cerebellum', 'spine', 'bones',
+                  'lymph node', 'lymph nodes', 'vasculature', 'aorta', 'portal vein', 'bile duct'
+                ];
+
+                const abnormalHints = [
+                  'lesion', 'mass', 'nodule', 'cyst', 'metast', 'enlarg', 'thicken', 'dilat', 'obstruct', 'stone', 'edema', 'infarct',
+                  'hemorr', 'aneurysm', 'effusion', 'opacity', 'consolidation', 'fracture', 'lytic', 'sclerotic', 'tear', 'stricture'
+                ];
+
+                const normalHints = [
+                  'normal', 'unremarkable', 'no focal', 'no significant', 'without abnormal', 'no evidence of', 'within normal limits'
+                ];
+
+                // Determine organs with abnormalities mentioned
+                const abnormalOrgans = new Set();
+                for (const s of sentences) {
+                  const low = s.toLowerCase();
+                  for (const organ of organs) {
+                    if (low.includes(organ)) {
+                      for (const hint of abnormalHints) {
+                        if (low.includes(hint)) {
+                          abnormalOrgans.add(organ);
+                          break;
+                        }
+                      }
+                    }
+                  }
+                }
+
+                // Filter out normal statements for those organs
+                const cleaned = sentences.filter(s => {
+                  const low = s.toLowerCase();
+                  // keep sentence if it is not a normal line for an abnormal organ
+                  for (const organ of abnormalOrgans) {
+                    if (low.includes(organ)) {
+                      for (const normal of normalHints) {
+                        if (low.includes(normal)) {
+                          return false; // drop conflicting normal line
+                        }
+                      }
+                    }
+                  }
+                  return true;
+                });
+
+                return cleaned.join(' ');
+              } catch (_) {
+                return findingsText;
+              }
+            }
+
+            // Clean findings for contradictions
+            const cleanedFindings = cleanConflictingNormals(reportData.findings);
+
+            // Create HTML report with all required sections
+            const reportHtml = `
+                <div class="report">
+                    <h1>${actualScanName}</h1>
+                    <div class="history">
+                        <h2>Clinical History</h2>
+                        ${clinical_history ? clinical_history : 'NA'}
+                    </div>
+                    <div class="technique">
+                        <h2>Technique</h2>
+                        ${reportData.technique || 'Standard imaging protocol was performed.'}
+                    </div>
+                    <div class="findings">
+                        <h2>Findings</h2>
+                        ${cleanedFindings || reportData.findings || actualFindings}
+
+                    </div>
+                    <div class="impression">
+                        <h2>Impression</h2>
+                        ${reportData.impression || 'No specific impression provided.'}
+                    </div>
+                    <div class="clinical-advice">
+                        <h2>Clinical Advice and Safety Considerations</h2>
+                        ${reportData.clinical_advice || 'No specific clinical advice.'}
+                    </div>
+                    ${reportData.clinician_questions && reportData.clinician_questions.length > 0 ? `
+                    <div class="clinician-questions">
+                        <h2>Clinician Simulation Questions</h2>
+                        <ol>
+                            ${reportData.clinician_questions.map(q => `<li>${q}</li>`).join('')}
+                        </ol>
+                    </div>` : ''}
+                    ${reportData.differential_diagnosis && reportData.differential_diagnosis.length > 0 ? `
+                    <div class="differential-diagnosis">
+                        <h2>Differential Diagnosis</h2>
+                        ${reportData.differential_diagnosis.map((dd, idx) => `
+                            <div class="differential-item">
+                                <strong>${idx + 1}. ${dd.diagnosis}</strong>
+                                <p>${dd.reasoning}</p>
+                            </div>
+                        `).join('')}
+                    </div>` : ''}
+                </div>
+            `;
+
+            // Create compatible response
+            const compatibleReport = {
+                scan_name: actualScanName,
+                findings: cleanedFindings || reportData.findings,
+                impression: reportData.impression,
+                clinical_advice: reportData.clinical_advice,
+                clinician_questions: reportData.clinician_questions || [],
+                technique: reportData.technique
+            };
+
+            return res.json({ 
+                reportHtml, 
+                impressionText: reportData.impression,
+                structuredData: compatibleReport,
+                text: `${reportData.technique}\n\n${cleanedFindings || reportData.findings}\n\n${reportData.impression}`,
+                report: compatibleReport
+            });
+
+        } catch (error) {
+            console.error('Error generating structured report:', error);
+            return res.status(500).json({ error: 'Failed to generate structured report: ' + error.message });
+        }
+    }
+
+    // Plain mode: require prompt
+    if (!prompt) return res.status(400).json({ error: 'Either provide findings OR prompt is required' });
+
+    const messages = [
+      { role: 'system', content: 'You are a helpful assistant that generates reports. Return your response as JSON with two fields: reportHtml (HTML content) and impressionText (summary text).' },
+      { role: 'user', content: prompt }
+    ];
+
+    const primaryModel = 'gpt-4o';
+    const fallbackModel = 'gpt-4o-mini';
+
+    async function getCompletion(model) {
+      const resp = await openai.chat.completions.create({
+        model,
+        messages,
+        temperature: 0.7,
+        max_tokens: 1000,
+        response_format: { type: "json_object" }
+      });
+      return resp.choices?.[0]?.message?.content || '';
+    }
+
+    let text = '';
+    try {
+      text = await getCompletion(primaryModel);
+    } catch (err) {
+      console.error('OpenAI primary model failed:', err?.response?.data || err?.message || err);
+      text = await getCompletion(fallbackModel);
+    }
+
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed.reportHtml && parsed.impressionText) {
+        return res.json(parsed);
+      }
+    } catch (_) {}
+
+    const reportHtml = `<div class="report"><h2>Generated Report</h2><p>${text.replace(/\n/g, '</p><p>')}</p></div>`;
+    const impressionText = text.split('\n')[0] || (text.substring(0, 160) + '...');
+
+    res.json({ reportHtml, impressionText });
+  } catch (e) {
+    console.error('OpenAI error:', e?.response?.data || e?.message || e);
+    res.status(500).json({ error: 'Failed to generate report' });
+  }
+});
+
+
+
+// NEW: Add this analyze-report endpoint
+app.post('/api/analyze-report', authenticateSupabase, async (req, res) => {
+  try {
+    const { reportContent } = req.body;
+
+    if (!reportContent) {
+      return res.status(400).json({ error: 'reportContent is required' });
+    }
+
+    // Construct a prompt for the OpenAI API
+    const analysisPrompt = `
+      Analyze the following radiology report. Based on the report, provide:
+      1.  A "whatNotToMiss" array of critical findings that should not be overlooked.
+      2.  A "differentials" array with the top 3 differential diagnoses, including why each fits and why it might not fit.
+      
+      Report Content:
+      ${reportContent}
+    `;
+
+    const messages = [
+      { role: 'system', content: 'You are an expert radiologist providing clinical analysis. Return your response as a JSON object with two keys: "whatNotToMiss" and "differentials".' },
+      { role: 'user', content: analysisPrompt }
+    ];
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages,
+      response_format: { type: 'json_object' }
+    });
+
+    const analysis = JSON.parse(response.choices[0].message.content);
+
+    res.json({ success: true, analysis });
+
+  } catch (e) {
+    console.error('Analysis error:', e?.response?.data || e?.message || e);
+    res.status(500).json({ error: 'Failed to analyze report' });
+  }
+});
+
+
+
+
+
+// Note: Critical features system removed for simplification
+
+// ===== API REDIRECTS =====
+// Configure API redirects for backward compatibility
+// Generate report redirect (CRITICAL - DO NOT REMOVE)
+app.post('/generate-report', (req, res) => {
+  console.log('[REDIRECT] Redirecting /generate-report to /api/generate-report');
+  req.url = '/api/generate-report';
+  app._router.handle(req, res);
+});
+
+// Transcribe redirect (CRITICAL - DO NOT REMOVE)
+app.post('/transcribe', (req, res) => {
+  console.log('[REDIRECT] Redirecting /transcribe to /api/transcribe');
+  req.url = '/api/transcribe';
+  app._router.handle(req, res);
+});
+
+// Analyze report redirect (CRITICAL - DO NOT REMOVE)
+app.post('/analyze-report', (req, res) => {
+  console.log('[REDIRECT] Redirecting /analyze-report to /api/analyze-report');
+  req.url = '/api/analyze-report';
+  app._router.handle(req, res);
+});
+
+// Search redirect (CRITICAL - DO NOT REMOVE)
+app.post('/search', (req, res) => {
+  console.log('[REDIRECT] Redirecting /search to /api/search');
+  req.url = '/api/search';
+  app._router.handle(req, res);
+});
+
+// ===== TRANSCRIPTION ENDPOINT =====
+// Configure multer for audio file uploads
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    // Accept audio formats and video/webm (which browsers often use for audio)
+    if (file.mimetype.startsWith('audio/') || file.mimetype === 'video/webm') {
+      cb(null, true);
+    } else {
+      cb(new Error('Only audio files are allowed. Supported types: audio/*, video/webm'), false);
+    }
+  }
+});
+
+// Initialize Deepgram only if API key is available
+let deepgram = null;
+if (process.env.DEEPGRAM_API_KEY) {
+  try {
+    deepgram = new Deepgram(process.env.DEEPGRAM_API_KEY);
+  } catch (error) {
+    console.warn('Deepgram initialization failed:', error.message);
+  }
+}
+
+app.post('/api/transcribe', (req, res, next) => {
+  console.log('[TRANSCRIBE] Request received, checking authentication...');
+  authenticateSupabase(req, res, next);
+}, upload.single('audio'), async (req, res) => {
+  try {
+    console.log('[TRANSCRIBE] After multer processing:');
+    console.log('- req.file:', req.file ? 'Present' : 'Missing');
+    console.log('- req.body keys:', Object.keys(req.body || {}));
+    console.log('- Content-Type:', req.headers['content-type']);
+    console.log('- Content-Length:', req.headers['content-length']);
+    
+    // Check if audio file was uploaded
+    if (!req.file) {
+      console.log('[TRANSCRIBE] No file found - returning 400 error');
+      return res.status(400).json({ 
+        error: 'No audio file provided',
+        code: 'NO_AUDIO_FILE'
+      });
+    }
+
+    // Check if Deepgram is available
+    if (!deepgram) {
+      return res.status(500).json({ 
+        error: 'Deepgram API key not configured',
+        code: 'API_KEY_MISSING'
+      });
+    }
+
+    // Get audio buffer and metadata
+    const audioBuffer = req.file.buffer;
+    const mimeType = req.file.mimetype;
+    
+    // Determine audio format
+    let format = 'webm';
+    if (mimeType.includes('mp4') || mimeType.includes('m4a')) {
+      format = 'mp4';
+    } else if (mimeType.includes('wav')) {
+      format = 'wav';
+    } else if (mimeType.includes('mp3')) {
+      format = 'mp3';
+    }
+
+    // Get optional parameters
+    const language = req.body.language || 'en-US';
+    const model = req.body.model || 'nova-2';
+    const smartFormat = req.body.smart_format === 'true';
+    const punctuate = req.body.punctuate !== 'false';
+
+    console.log(`[TRANSCRIBE] Processing ${format} audio (${audioBuffer.length} bytes)`);
+
+    // Send to Deepgram
+    const response = await deepgram.transcription.preRecorded(
+      { buffer: audioBuffer, mimetype: mimeType },
+      {
+        model: model,
+        language: language,
+        smart_format: smartFormat,
+        punctuate: punctuate,
+        interim_results: false,
+        endpointing: 200, // End of speech detection
+        utterance_end_ms: 1000, // Wait 1 second after last word
+      }
+    );
+
+    // Extract transcript
+    const transcript = response.results?.channels[0]?.alternatives[0]?.transcript || '';
+    const confidence = response.results?.channels[0]?.alternatives[0]?.confidence || 0;
+    const detectedLanguage = response.metadata?.language || language;
+    const duration = response.metadata?.duration || 0;
+
+    console.log(`[TRANSCRIBE] Success: ${transcript.length} chars, confidence: ${confidence}`);
+
+    // Return success response
+    res.json({
+      text: transcript,
+      success: true
+    });
+
+  } catch (error) {
+    console.error('[TRANSCRIBE] Error:', error);
+    
+    // Handle specific error types
+    if (error.message?.includes('file size')) {
+      return res.status(400).json({ 
+        error: 'Audio file too large (max 50MB)',
+        code: 'FILE_TOO_LARGE'
+      });
+    }
+    
+    if (error.message?.includes('Only audio files')) {
+      return res.status(400).json({ 
+        error: 'Invalid file type. Only audio files allowed. Supported types: audio/*, video/webm',
+        code: 'INVALID_FORMAT',
+        supportedTypes: ['audio/*', 'video/webm']
+      });
+    }
+
+    // Handle Deepgram API errors
+    if (error.response?.data) {
+      return res.status(500).json({
+        error: 'Transcription service error: ' + error.response.data.error,
+        code: 'DEEPGRAM_ERROR',
+        details: error.response.data
+      });
+    }
+
+    // Generic error response with more details
+    res.status(500).json({ 
+      error: 'Transcription failed: ' + (error.message || 'Unknown error'),
+      code: 'TRANSCRIPTION_ERROR',
+      type: error.constructor.name,
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
+
+
+// ===== SEARCH ENDPOINT =====
+app.post('/api/search', authenticateSupabase, async (req, res) => {
+  try {
+    const { query, source, limit = 5, searchEngineId = null } = req.body;
+    
+    if (!query) {
+      return res.status(400).json({ 
+        error: 'Query is required',
+        code: 'MISSING_QUERY'
+      });
+    }
+
+    if (!source || (Array.isArray(source) && source.length === 0)) {
+      return res.status(400).json({ 
+        error: 'At least one source is required. Use "pubmed", "radiopaedia", "google", or ["pubmed", "radiopaedia", "google"]',
+        code: 'MISSING_SOURCE'
+      });
+    }
+
+    let allResults = [];
+    const sources = Array.isArray(source) ? source : [source];
+    
+    // Search all selected sources
+    for (const src of sources) {
+      try {
+        let results = [];
+        switch (src.toLowerCase()) {
+          case 'pubmed':
+            results = await searchPubMed(query, Math.ceil(limit / sources.length));
+            break;
+          case 'radiopaedia':
+            results = await searchRadiopaedia(query, Math.ceil(limit / sources.length));
+            break;
+          case 'google':
+            results = await searchGoogle(query, Math.ceil(limit / sources.length), searchEngineId);
+            break;
+          default:
+            console.warn(`[SEARCH] Unsupported source: ${src}`);
+            continue;
+        }
+        
+        // Add source info to results if not already present
+        results = results.map(result => ({
+          ...result,
+          source: result.source || src.toLowerCase(),
+          sourceName: result.sourceName || (
+            src.toLowerCase() === 'pubmed' ? 'PubMed' : 
+            src.toLowerCase() === 'radiopaedia' ? 'Radiopaedia' : 
+            src.toLowerCase() === 'google' ? 'Google' : src
+          )
+        }));
+        
+        allResults.push(...results);
+      } catch (error) {
+        console.error(`[SEARCH] Error searching ${src}:`, error);
+        // Continue with other sources even if one fails
+      }
+    }
+
+    // Sort by relevance and limit total results
+    allResults.sort((a, b) => (b.relevance || 0) - (a.relevance || 0));
+    allResults = allResults.slice(0, limit);
+
+    res.json({
+      success: true,
+      sources: sources,
+      query: query,
+      results: allResults,
+      count: allResults.length
+    });
+
+  } catch (error) {
+    console.error('[SEARCH] Error:', error);
+    res.status(500).json({ 
+      error: 'Search failed: ' + (error.message || 'Unknown error'),
+      code: 'SEARCH_ERROR'
+    });
+  }
+});
+
+
+
+// Helper function for PubMed search
+async function searchPubMed(query, limit) {
+  try {
+    console.log(`[PUBMED] Searching for: ${query}`);
+    
+    // PubMed E-utilities API (free, no API key required)
+    const baseUrl = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils';
+    const searchUrl = `${baseUrl}/esearch.fcgi?db=pubmed&term=${encodeURIComponent(query)}&retmax=${limit}&retmode=json&sort=relevance`;
+    
+    const searchResponse = await fetch(searchUrl);
+    if (!searchResponse.ok) {
+      throw new Error(`PubMed search failed: ${searchResponse.status}`);
+    }
+    
+    const searchData = await searchResponse.json();
+    const pmids = searchData.esearchresult?.idlist || [];
+    
+    if (pmids.length === 0) {
+      return [];
+    }
+    
+    // Get detailed information for each PMID
+    const summaryUrl = `${baseUrl}/esummary.fcgi?db=pubmed&id=${pmids.join(',')}&retmode=json`;
+    const summaryResponse = await fetch(summaryUrl);
+    
+    if (!summaryResponse.ok) {
+      throw new Error(`PubMed summary failed: ${summaryResponse.status}`);
+    }
+    
+    const summaryData = await summaryResponse.json();
+    const results = [];
+    
+    for (const pmid of pmids) {
+      const article = summaryData.result[pmid];
+      if (article) {
+        results.push({
+          id: `pubmed-${pmid}`,
+          pmid: pmid,
+          title: article.title || 'No title available',
+          authors: article.authors?.map(a => a.name).join(', ') || 'Unknown authors',
+          journal: article.fulljournalname || 'Unknown journal',
+          year: article.pubdate?.split(' ')[0] || 'Unknown year',
+          abstract: article.abstract || 'No abstract available',
+          url: `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`,
+          relevance: 0.9 - (results.length * 0.05), // Slight relevance decrease for variety
+          doi: article.articleids?.find(id => id.idtype === 'doi')?.value,
+          source: 'pubmed',
+          sourceName: 'PubMed'
+        });
+      }
+    }
+    
+    console.log(`[PUBMED] Found ${results.length} results for: ${query}`);
+    return results.slice(0, limit);
+    
+  } catch (error) {
+    console.error('[PUBMED] Error:', error);
+    
+    // Return empty results instead of mock data
+    // This allows the frontend to handle the error gracefully
+    return [];
+  }
+}
+
+// Helper function for Google Custom Search
+async function searchGoogle(query, limit, searchEngineId = null) {
+  try {
+    console.log(`[GOOGLE] Searching for: ${query}`);
+    
+    // Google Custom Search API key and Search Engine ID
+    const API_KEY = 'AIzaSyCJFXNxsTLlRZPP78JNwhZdOsm6tgrHK84';
+    const SEARCH_ENGINE_ID = searchEngineId || process.env.GOOGLE_SEARCH_ENGINE_ID || ''; 
+    
+    if (!SEARCH_ENGINE_ID) {
+      console.warn('[GOOGLE] Search Engine ID not configured. Please set GOOGLE_SEARCH_ENGINE_ID in your .env file or provide it in the request.');
+      return [];
+    }
+    
+    // Google Custom Search API URL
+    const searchUrl = `https://www.googleapis.com/customsearch/v1?key=${API_KEY}&cx=${SEARCH_ENGINE_ID}&q=${encodeURIComponent(query)}&num=${limit}`;
+    
+    console.log(`[GOOGLE] Searching with URL: ${searchUrl}`);
+    const response = await fetch(searchUrl);
+    
+    // Log the response status
+    console.log(`[GOOGLE] Response status: ${response.status} ${response.statusText}`);
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`[GOOGLE] Error response: ${errorText}`);
+      throw new Error(`Google search failed: ${response.status} ${response.statusText}`);
+    }
+    
+    const data = await response.json();
+    console.log(`[GOOGLE] Response data:`, JSON.stringify(data, null, 2));
+    const results = [];
+    
+    // Process search results
+    if (data.items && Array.isArray(data.items)) {
+      for (const item of data.items) {
+        results.push({
+          id: `google-${item.cacheId || item.link.replace(/[^a-zA-Z0-9]/g, '-')}`,
+          title: item.title || 'No title available',
+          description: item.snippet || 'No description available',
+          url: item.link,
+          displayUrl: item.displayLink || item.link,
+          category: 'Web',
+          relevance: 0.9 - (results.length * 0.05), // Slight relevance decrease for variety
+          thumbnailUrl: item.pagemap?.cse_thumbnail?.[0]?.src,
+          source: 'google',
+          sourceName: 'Google'
+        });
+      }
+    }
+    
+    console.log(`[GOOGLE] Found ${results.length} results for: ${query}`);
+    return results.slice(0, limit);
+    
+  } catch (error) {
+    console.error('[GOOGLE] Error:', error);
+    // Return empty results
+    return [];
+  }
+}
+
+// Helper function for Radiopaedia search
+async function searchRadiopaedia(query, limit) {
+  try {
+    console.log(`[RADIOPAEDIA] Searching for: ${query}`);
+    
+    // Try multiple Radiopaedia search strategies
+    let results = [];
+    
+    // Strategy 1: Direct API search
+    try {
+      const searchUrl = `https://radiopaedia.org/api/v1/articles/?search=${encodeURIComponent(query)}&limit=${limit}`;
+      
+      const response = await fetch(searchUrl, {
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'RadiologyApp/1.0'
+        }
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        
+        if (data && Array.isArray(data)) {
+          for (const article of data) {
+            results.push({
+              id: `radiopaedia-${article.id}`,
+              radiopaediaId: article.id,
+              title: article.title || 'No title available',
+              description: article.description || article.summary || 'No description available',
+              url: `https://radiopaedia.org/articles/${article.slug || article.id}`,
+              category: article.category?.name || 'Radiology',
+              relevance: 0.95 - (results.length * 0.05),
+              imageCount: article.image_count || 0,
+              caseCount: article.case_count || 0,
+              lastUpdated: article.updated_at || article.created_at,
+              source: 'radiopaedia',
+              sourceName: 'Radiopaedia'
+            });
+          }
+        }
+      }
+    } catch (apiError) {
+      console.log(`[RADIOPAEDIA] API search failed, trying alternative methods:`, apiError.message);
+    }
+    
+    // Strategy 2: If no results from API, try common radiology topics mapping
+    if (results.length === 0) {
+      console.log(`[RADIOPAEDIA] No API results, trying topic mapping for: ${query}`);
+      
+      // Map common medical terms to Radiopaedia topics
+      const topicMapping = {
+        'pneumonia': 'pneumonia',
+        'lung cancer': 'lung-cancer',
+        'brain tumor': 'brain-tumour',
+        'fracture': 'fracture',
+        'pulmonary embolism': 'pulmonary-embolism',
+        'appendicitis': 'appendicitis',
+        'gallstones': 'gallstones',
+        'kidney stones': 'renal-calculi',
+        'aortic aneurysm': 'aortic-aneurysm',
+        'stroke': 'ischaemic-stroke',
+        'heart attack': 'myocardial-infarction',
+        'breast cancer': 'breast-cancer',
+        'colon cancer': 'colorectal-cancer',
+        'liver cancer': 'hepatocellular-carcinoma',
+        'pancreatic cancer': 'pancreatic-cancer'
+      };
+      
+      // Find matching topics
+      const queryLower = query.toLowerCase();
+      const matchingTopics = Object.entries(topicMapping)
+        .filter(([term, topic]) => 
+          queryLower.includes(term) || term.includes(queryLower) || 
+          queryLower.includes(topic.replace(/-/g, ' ')) ||
+          topic.replace(/-/g, ' ').includes(queryLower)
+        )
+        .slice(0, limit);
+      
+      for (const [term, topic] of matchingTopics) {
+        results.push({
+          id: `radiopaedia-topic-${topic}`,
+          title: `${term.charAt(0).toUpperCase() + term.slice(1)} - Radiopaedia.org`,
+          description: `Comprehensive radiological information about ${term} including imaging findings, differential diagnosis, and case studies.`,
+          url: `https://radiopaedia.org/articles/${topic}`,
+          category: 'Radiology',
+          relevance: 0.85,
+          source: 'radiopaedia',
+          sourceName: 'Radiopaedia',
+          isTopicMapping: true
+        });
+      }
+    }
+    
+    // Strategy 3: If still no results, try general radiology categories
+    if (results.length === 0) {
+      console.log(`[RADIOPAEDIA] No topic matches, trying general categories for: ${query}`);
+      
+      const generalCategories = [
+        'chest', 'abdomen', 'brain', 'spine', 'musculoskeletal', 
+        'cardiovascular', 'gastrointestinal', 'genitourinary', 'head-neck'
+      ];
+      
+      const matchingCategories = generalCategories.filter(category => 
+        query.toLowerCase().includes(category) || category.includes(query.toLowerCase())
+      );
+      
+      for (const category of matchingCategories.slice(0, limit)) {
+        results.push({
+          id: `radiopaedia-category-${category}`,
+          title: `${category.charAt(0).toUpperCase() + category.slice(1)} Radiology - Radiopaedia.org`,
+          description: `Browse ${category} radiology cases, imaging findings, and clinical information.`,
+          url: `https://radiopaedia.org/cases?body_part=${category}`,
+          category: 'Radiology',
+          relevance: 0.75,
+          source: 'radiopaedia',
+          sourceName: 'Radiopaedia',
+          isCategoryMapping: true
+        });
+      }
+    }
+    
+    console.log(`[RADIOPAEDIA] Found ${results.length} results for: ${query}`);
+    return results.slice(0, limit);
+    
+  } catch (error) {
+    console.error('[RADIOPAEDIA] Error:', error);
+    
+    // Return empty results instead of mock data
+    // This allows the frontend to handle the error gracefully
+    return [];
+  }
+}
+
+// Graceful shutdown for nodemon restarts and Ctrl+C
+function shutdown(signal) {
+  console.log(`Received ${signal}, shutting down gracefully...`);
+  try { 
+    wss.close(); 
+    console.log('WebSocket server closed');
+  } catch (e) {}
+  
+  server.close(() => {
+    console.log('HTTP server closed');
+    process.exit(0);
+  });
+  
+  // Force exit after 5 seconds if graceful shutdown fails
+  setTimeout(() => {
+    console.log('Forcing exit...');
+    process.exit(1);
+  }, 5000);
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGUSR2', () => { // nodemon restart signal
+  console.log('Nodemon restart detected, shutting down...');
+  shutdown('SIGUSR2');
+});

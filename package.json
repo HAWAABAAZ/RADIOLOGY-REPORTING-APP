@@ -1,0 +1,53 @@
+{
+  "name": "radiology-report-backend",
+  "version": "1.0.0",
+  "description": "Production-ready Radiology Report Generator Backend with Supabase Auth",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "dev": "NODE_ENV=development node index.js",
+    "build": "npx tsc",
+    "start": "NODE_ENV=production node index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "smoke-test": "node examples/smoke-test.js"
+  },
+  "keywords": [
+    "radiology",
+    "ai",
+    "reports",
+    "supabase",
+    "openai"
+  ],
+  "author": "HAWAABAAZ",
+  "license": "MIT",
+  "dependencies": {
+    "@deepgram/sdk": "^1.21.0",
+    "@supabase/supabase-js": "^2.56.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express": "^4.21.2",
+    "fast-json-patch": "^3.1.1",
+    "jose": "^6.0.13",
+    "multer": "^2.0.2",
+    "mustache": "^4.2.0",
+    "node-fetch": "^3.3.2",
+    "openai": "^5.16.0",
+    "ws": "^8.18.3",
+    "zod": "^3.25.76"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/jest": "^30.0.0",
+    "@types/mustache": "^4.2.6",
+    "@types/node": "^24.3.0",
+    "jest": "^30.1.1",
+    "ts-jest": "^29.4.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
